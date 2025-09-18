@@ -112,9 +112,8 @@ def fetch_file(year, month, day, hour):
         status_text.text("Connecting to FTP server...")
 
         try:
-            with ftplib.FTP(FTP_HOST, timeout=60) as ftp:
+            with ftplib.FTP(FTP_HOST, timeout=30) as ftp:
                 ftp.login()
-                ftp.set_pasv(False)  # Disable passive mode for older FTP servers
                 progress_bar.progress(20)
                 status_text.text("Connected. Navigating to directory...")
                 
