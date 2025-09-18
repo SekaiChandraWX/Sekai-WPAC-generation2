@@ -12,6 +12,8 @@ import time
 import struct
 from scipy import ndimage
 from PIL import Image, ImageDraw, ImageFont
+import warnings
+import shutil
 
 # Constants
 FTP_HOST = "gms.cr.chiba-u.ac.jp"
@@ -20,6 +22,100 @@ GMS5_END_DATE = datetime(2003, 5, 22, 0)
 GOES9_START_DATE = datetime(2003, 5, 22, 1)
 GOES9_END_DATE = datetime(2005, 6, 28, 2)
 VERTICAL_STRETCH = 1.35
+
+def comprehensive_patch_gms5_reader():
+    """Comprehensive patch for GMS5 reader to handle historical file variants"""
+    try:
+        from satpy.readers.gms import gms5_vissr_l1b
+        
+        # Check if already patched
+        if hasattr(gms5_vissr_l1b.GMS5VISSRFileHandler, '_patched_comprehensive'):
+            return
+
+        # Store original methods
+        original_read_image_data = gms5_vissr_l1b.GMS5VISSRFileHandler._read_image_data
+        original_get_actual_shape = gms5_vissr_l1b.GMS5VISSRFileHandler._get_actual_shape
+
+        def safe_read_from_file_obj(file_obj, dtype, count, offset=0):
+            """Safe version of read_from_file_obj that handles buffer size issues"""
+            file_obj.seek(offset)
+            remaining_data = file_obj.read()
+            actual_bytes = len(remaining_data)
+            bytes_needed = dtype.itemsize * count
+
+            if actual_bytes < bytes_needed:
+                actual_count = actual_bytes // dtype.itemsize
+                if actual_count == 0:
+                    raise ValueError(f"Not enough data to read even one record of type {dtype}")
+            else:
+                actual_count = count
+                remaining_data = remaining_data[:bytes_needed]
+
+            return np.frombuffer(remaining_data, dtype=dtype, count=actual_count)
+
+        def patched_read_image_data(self):
+            """Patched version that uses safe file reading"""
+            try:
+                return original_read_image_data(self)
+            except (ValueError, struct.error) as e:
+                if "buffer is smaller than requested size" in str(e) or "unpack requires" in str(e):
+                    return self._read_image_data_completely_safe()
+                raise e
+
+        def patched_get_actual_shape(self):
+            """Patched version that calculates safe shape"""
+            try:
+                return original_get_actual_shape(self)
+            except Exception:
+                return self._get_file_based_shape()
+
+        def _read_image_data_completely_safe(self):
+            """Completely safe image data reading"""
+            specs = self._get_image_data_type_specs()
+            file_size = os.path.getsize(self._filename)
+            available_data = file_size - specs["offset"]
+            max_records = available_data // specs["dtype"].itemsize
+
+            from satpy.readers.utils import generic_open
+            with generic_open(self._filename, "rb") as file_obj:
+                return safe_read_from_file_obj(
+                    file_obj,
+                    dtype=specs["dtype"],
+                    count=max_records,
+                    offset=specs["offset"]
+                )
+
+        def _get_file_based_shape(self):
+            """Calculate shape based on actual file content"""
+            try:
+                _, nominal_pixels = self._get_nominal_shape()
+            except:
+                nominal_pixels = 2366
+
+            specs = self._get_image_data_type_specs()
+            file_size = os.path.getsize(self._filename)
+            available_data = file_size - specs["offset"]
+
+            if specs["dtype"].names:
+                sample_record_size = specs["dtype"].itemsize
+                max_lines = available_data // sample_record_size
+            else:
+                bytes_per_pixel = specs["dtype"].itemsize
+                total_pixels = available_data // bytes_per_pixel
+                max_lines = total_pixels // nominal_pixels
+
+            return max_lines, nominal_pixels
+
+        # Apply the patches
+        gms5_vissr_l1b.GMS5VISSRFileHandler._read_image_data = patched_read_image_data
+        gms5_vissr_l1b.GMS5VISSRFileHandler._get_actual_shape = patched_get_actual_shape
+        gms5_vissr_l1b.GMS5VISSRFileHandler._read_image_data_completely_safe = _read_image_data_completely_safe
+        gms5_vissr_l1b.GMS5VISSRFileHandler._get_file_based_shape = _get_file_based_shape
+        gms5_vissr_l1b.GMS5VISSRFileHandler._patched_comprehensive = True
+        gms5_vissr_l1b.read_from_file_obj = safe_read_from_file_obj
+
+    except ImportError:
+        st.warning("Satpy not available - will use manual reading only")
 
 def create_colormap():
     """Create custom satellite colormap"""
@@ -30,18 +126,8 @@ def create_colormap():
         (120 / 140, "#eb6fc0"), (130 / 140, "#9b1f94"), (140 / 140, "#330f2f")
     ]).reversed()
 
-def get_satellite_for_date(year, month, day, hour):
-    """Determine which satellite covers the given date"""
-    request_time = datetime(year, month, day, hour)
-    
-    if GMS5_START_DATE <= request_time <= GMS5_END_DATE:
-        return "GMS5"
-    elif GOES9_START_DATE <= request_time <= GOES9_END_DATE:
-        return "GOES9"
-    return None
-
-def manual_reading(file_path):
-    """Manual reading method for satellite data"""
+def try_manual_reading(file_path, year, month, day, hour):
+    """Fallback manual reading method if Satpy fails"""
     try:
         with open(file_path, 'rb') as f:
             data = f.read()
@@ -67,18 +153,14 @@ def manual_reading(file_path):
             image_data = data[header_size:]
             image_array = np.frombuffer(image_data, dtype=np.uint8)
 
-            # Calculate how much data we can actually use
             available_pixels = len(image_array)
             target_pixels = width * height
             
             if available_pixels >= target_pixels:
-                # We have enough data
                 image = image_array[:target_pixels].reshape(height, width)
             else:
-                # Adjust dimensions to fit available data
                 height = available_pixels // width
-                if height < 100:  # Too small, try different approach
-                    # Try square-ish dimensions
+                if height < 100:
                     side = int(np.sqrt(available_pixels))
                     width = height = side
                     image = image_array[:side*side].reshape(height, width)
@@ -87,12 +169,26 @@ def manual_reading(file_path):
 
             # Convert to temperature (approximated calibration)
             temperature = 180.0 + (image.astype(np.float32) / 255.0) * (320.0 - 180.0)
-            return temperature
+
+            # Create xarray DataArray to mimic Satpy output
+            import xarray as xr
+            ir1_data = xr.DataArray(
+                temperature,
+                dims=['y', 'x'],
+                attrs={
+                    'platform': 'GMS-5',
+                    'sensor': 'VISSR',
+                    'units': 'K',
+                    'standard_name': 'brightness_temperature',
+                    'start_time': datetime(year, month, day, hour),
+                }
+            )
+            return ir1_data
         else:
             raise ValueError("Insufficient data in file")
 
     except Exception as e:
-        st.error(f"Manual reading failed: {e}")
+        print(f"Manual reading failed: {e}")
         return None
 
 @st.cache_data(ttl=3600)
@@ -161,8 +257,9 @@ def fetch_file(year, month, day, hour):
                         tar.extract(member, path=temp_dir)
                         extracted_path = os.path.join(temp_dir, member.name)
 
-                        # Create final file path
-                        local_img_path = os.path.join(temp_dir, "satellite_data.img")
+                        # Create the filename that Satpy expects
+                        satpy_filename = f"VISSR_{year}{month:02d}{day:02d}_{hour:02d}00_IR1.A.IMG"
+                        local_img_path = os.path.join(temp_dir, satpy_filename)
 
                         with gzip.open(extracted_path, 'rb') as f_in:
                             with open(local_img_path, 'wb') as f_out:
@@ -189,16 +286,42 @@ def process_and_plot(file_path, satellite, year, month, day, hour):
     temp_dir = os.path.dirname(file_path)
     
     try:
-        # Use manual reading
-        kelvin_values = manual_reading(file_path)
-        if kelvin_values is None:
-            raise ValueError("Failed to read satellite data")
+        # Apply comprehensive patches
+        comprehensive_patch_gms5_reader()
+        warnings.filterwarnings('ignore')
 
-        # Convert to Celsius
+        ir1_data = None
+
+        try:
+            # Try with Satpy first
+            print("Attempting to read with Satpy...")
+            from satpy import Scene
+            scene = Scene([file_path], reader='gms5-vissr_l1b', reader_kwargs={"mask_space": False})
+            scene.load(["IR1"])
+            ir1_data = scene["IR1"]
+            satellite_name = ir1_data.attrs.get('platform', satellite)
+            print("Successfully loaded with Satpy")
+
+        except Exception as e:
+            print(f"Satpy failed: {e}")
+            print("Trying manual reading method...")
+
+            # Try manual reading as fallback
+            ir1_data = try_manual_reading(file_path, year, month, day, hour)
+
+            if ir1_data is None:
+                raise ValueError("Both Satpy and manual reading failed")
+
+            satellite_name = satellite
+            print("Successfully loaded with manual method")
+
+        # Process the data
+        kelvin_values = ir1_data.values
         celsius_values = kelvin_values - 273.15
 
         # Apply vertical stretch
         if VERTICAL_STRETCH != 1.0:
+            original_height, original_width = celsius_values.shape
             celsius_values = ndimage.zoom(celsius_values, (VERTICAL_STRETCH, 1.0), order=1)
 
         # Create visualization
@@ -209,40 +332,58 @@ def process_and_plot(file_path, satellite, year, month, day, hour):
         fig, ax = plt.subplots(figsize=(12, 10), dpi=300)
         ax.imshow(celsius_values, cmap=custom_cmap, vmin=vmin, vmax=vmax)
 
+        ax.grid(False)
+        ax.axis('off')
+        ax.set_xticks([])
+        ax.set_yticks([])
+
         # Remove all borders
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
         ax.spines['bottom'].set_visible(False)
         ax.spines['left'].set_visible(False)
-        ax.set_xticks([])
-        ax.set_yticks([])
 
         # Save the plot
-        final_image_path = os.path.join(temp_dir, 'satellite_data_plot.jpg')
-        plt.savefig(final_image_path, format='jpg', bbox_inches='tight', pad_inches=0, dpi=300)
+        plot_path = os.path.join(temp_dir, 'satellite_data_plot.jpg')
+        plt.savefig(plot_path, format='jpg', dpi=300, bbox_inches='tight', pad_inches=0)
         plt.close()
 
-        # Add watermarks using PIL
-        img_pil = Image.open(final_image_path)
-        draw = ImageDraw.Draw(img_pil)
+        # Open the saved image and stretch it sideways by 75%
+        img = Image.open(plot_path)
+        width, height = img.size
+        new_width = int(width * 1.75)
+        img = img.resize((new_width, height), Image.LANCZOS)
+
+        # Add watermarks
+        draw = ImageDraw.Draw(img)
         
         try:
             font = ImageFont.truetype("arial.ttf", 50)
         except:
             font = ImageFont.load_default()
         
-        watermark_text_top = f"{satellite} Data for {year}-{month:02d}-{day:02d} at {hour:02d}:00 UTC"
+        watermark_text_top = f"{satellite_name} Data for {year}-{month:02d}-{day:02d} at {hour:02d}:00 UTC"
         watermark_text_bottom = "Plotted by Sekai Chandra @Sekai_WX"
-        
         draw.text((10, 10), watermark_text_top, fill="white", font=font)
-        draw.text((10, img_pil.height - 70), watermark_text_bottom, fill="red", font=font)
-        
-        img_pil.save(final_image_path)
+        draw.text((10, height - 70), watermark_text_bottom, fill="red", font=font)
+
+        # Save the final image
+        final_image_path = os.path.join(temp_dir, 'final_satellite_data_plot.jpg')
+        img.save(final_image_path)
 
         return final_image_path
 
     except Exception as e:
         raise e
+    finally:
+        # Clean up files safely
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
 
 def main():
     st.set_page_config(
