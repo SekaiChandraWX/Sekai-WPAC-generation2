@@ -172,8 +172,6 @@ def fetch_file(year, month, day, hour):
 
     except Exception as e:
         return None, None, f"General error in fetch_file: {e}"
-    finally:
-        # Note: We don't clean up temp_dir here as we need the file for processing
 
 def process_and_plot(file_path, satellite, year, month, day, hour):
     """Process and plot the satellite data"""
