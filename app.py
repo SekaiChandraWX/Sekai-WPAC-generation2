@@ -9,10 +9,9 @@ from datetime import datetime
 import streamlit as st
 import tempfile
 import time
-import shutil
 import struct
 from scipy import ndimage
-import warnings
+from PIL import Image, ImageDraw, ImageFont
 
 # Constants
 FTP_HOST = "gms.cr.chiba-u.ac.jp"
@@ -41,8 +40,8 @@ def get_satellite_for_date(year, month, day, hour):
         return "GOES9"
     return None
 
-def try_manual_reading(file_path, year, month, day, hour):
-    """Fallback manual reading method if Satpy fails"""
+def manual_reading(file_path):
+    """Manual reading method for satellite data"""
     try:
         with open(file_path, 'rb') as f:
             data = f.read()
@@ -52,6 +51,9 @@ def try_manual_reading(file_path, year, month, day, hour):
             try:
                 width = struct.unpack('>H', data[8:10])[0]
                 height = struct.unpack('>H', data[10:12])[0]
+                if width > 5000 or height > 5000 or width < 100 or height < 100:
+                    width = 2366
+                    height = 2366
             except:
                 width = 2366
                 height = 2366
@@ -61,17 +63,27 @@ def try_manual_reading(file_path, year, month, day, hour):
 
         # Skip header and get image data
         header_size = 352
-        if len(data) > header_size + width * height:
-            image_data = data[header_size:header_size + width * height]
+        if len(data) > header_size:
+            image_data = data[header_size:]
             image_array = np.frombuffer(image_data, dtype=np.uint8)
 
-            expected_size = width * height
-            if len(image_array) >= expected_size:
-                image = image_array[:expected_size].reshape(height, width)
+            # Calculate how much data we can actually use
+            available_pixels = len(image_array)
+            target_pixels = width * height
+            
+            if available_pixels >= target_pixels:
+                # We have enough data
+                image = image_array[:target_pixels].reshape(height, width)
             else:
-                available_pixels = len(image_array)
+                # Adjust dimensions to fit available data
                 height = available_pixels // width
-                image = image_array[:height * width].reshape(height, width)
+                if height < 100:  # Too small, try different approach
+                    # Try square-ish dimensions
+                    side = int(np.sqrt(available_pixels))
+                    width = height = side
+                    image = image_array[:side*side].reshape(height, width)
+                else:
+                    image = image_array[:height * width].reshape(height, width)
 
             # Convert to temperature (approximated calibration)
             temperature = 180.0 + (image.astype(np.float32) / 255.0) * (320.0 - 180.0)
@@ -145,12 +157,12 @@ def fetch_file(year, month, day, hour):
             with tarfile.open(local_tar_path, 'r') as tar:
                 for member in tar.getmembers():
                     if member.name.endswith("IR1.A.IMG.gz"):
+                        member.name = os.path.basename(member.name)
                         tar.extract(member, path=temp_dir)
                         extracted_path = os.path.join(temp_dir, member.name)
 
                         # Create final file path
-                        satpy_filename = f"VISSR_{year}{month:02d}{day:02d}_{hour:02d}00_IR1.A.IMG"
-                        local_img_path = os.path.join(temp_dir, satpy_filename)
+                        local_img_path = os.path.join(temp_dir, "satellite_data.img")
 
                         with gzip.open(extracted_path, 'rb') as f_in:
                             with open(local_img_path, 'wb') as f_out:
@@ -177,23 +189,10 @@ def process_and_plot(file_path, satellite, year, month, day, hour):
     temp_dir = os.path.dirname(file_path)
     
     try:
-        warnings.filterwarnings('ignore')
-        
-        # Try to use Satpy first, fall back to manual reading
-        try:
-            # Try importing satpy
-            from satpy import Scene
-            scene = Scene([file_path], reader='gms5-vissr_l1b', reader_kwargs={"mask_space": False})
-            scene.load(["IR1"])
-            ir1_data = scene["IR1"]
-            kelvin_values = ir1_data.values
-            satellite_name = ir1_data.attrs.get('platform', satellite)
-        except (ImportError, Exception):
-            # Fall back to manual reading
-            kelvin_values = try_manual_reading(file_path, year, month, day, hour)
-            if kelvin_values is None:
-                raise ValueError("Both Satpy and manual reading failed")
-            satellite_name = satellite
+        # Use manual reading
+        kelvin_values = manual_reading(file_path)
+        if kelvin_values is None:
+            raise ValueError("Failed to read satellite data")
 
         # Convert to Celsius
         celsius_values = kelvin_values - 273.15
@@ -208,25 +207,22 @@ def process_and_plot(file_path, satellite, year, month, day, hour):
         vmax = 40
 
         fig, ax = plt.subplots(figsize=(12, 10), dpi=300)
-        img = ax.imshow(celsius_values, cmap=custom_cmap, vmin=vmin, vmax=vmax)
+        ax.imshow(celsius_values, cmap=custom_cmap, vmin=vmin, vmax=vmax)
 
-        ax.grid(False)
-        ax.axis('off')
-
-        # Remove axes completely
+        # Remove all borders
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_visible(False)
+        ax.spines['left'].set_visible(False)
         ax.set_xticks([])
         ax.set_yticks([])
-        for spine in ax.spines.values():
-            spine.set_visible(False)
 
-        dt = datetime(year, month, day, hour)
-        
         # Save the plot
-        final_image_path = os.path.join(temp_dir, 'final_satellite_data_plot.jpg')
+        final_image_path = os.path.join(temp_dir, 'satellite_data_plot.jpg')
         plt.savefig(final_image_path, format='jpg', bbox_inches='tight', pad_inches=0, dpi=300)
-        
+        plt.close()
+
         # Add watermarks using PIL
-        from PIL import Image, ImageDraw, ImageFont
         img_pil = Image.open(final_image_path)
         draw = ImageDraw.Draw(img_pil)
         
@@ -235,26 +231,18 @@ def process_and_plot(file_path, satellite, year, month, day, hour):
         except:
             font = ImageFont.load_default()
         
-        watermark_text_top = f"{satellite_name} Data for {year}-{month:02d}-{day:02d} at {hour:02d}:00 UTC"
+        watermark_text_top = f"{satellite} Data for {year}-{month:02d}-{day:02d} at {hour:02d}:00 UTC"
         watermark_text_bottom = "Plotted by Sekai Chandra @Sekai_WX"
         
         draw.text((10, 10), watermark_text_top, fill="white", font=font)
         draw.text((10, img_pil.height - 70), watermark_text_bottom, fill="red", font=font)
         
         img_pil.save(final_image_path)
-        plt.close()
 
         return final_image_path
 
     except Exception as e:
         raise e
-    finally:
-        # Clean up temp directory
-        try:
-            if temp_dir and os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
 
 def main():
     st.set_page_config(
